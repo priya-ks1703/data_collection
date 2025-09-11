@@ -195,7 +195,7 @@ def prev_page():
 current_id = st.session_state.order[st.session_state.page]
 payload = payloads.get(current_id, current_id)
 
-st.subheader(f"Item {st.session_state.page + 1}/{len(st.session_state.order)} (randomized)")
+st.subheader(f"Item {st.session_state.page + 1}/{len(st.session_state.order)}")
 _render_payload(payload)
 
 try:
