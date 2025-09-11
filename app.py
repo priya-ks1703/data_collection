@@ -118,7 +118,7 @@ def _first_unscored(order: List[str], scores: Dict[str, float]) -> int:
     for i, k in enumerate(order):
         if k not in scores:
             return i
-    return 0 if order else 0
+    return 0
 
 
 # -----------------------------------------------------------------------------
@@ -194,14 +194,9 @@ if "scores" not in st.session_state:
 for k, v in prefilled.items():
     st.session_state.scores[k] = v
 
-# Visibility toggle
-hide_completed = st.checkbox("Show only unscored items", value=True)
-
-completed_keys = set(k for k in st.session_state.scores if k in ids_all)
-visible_ids = [i for i in ids_all if (i not in completed_keys) or not hide_completed]
-
-# Order (restore from meta if possible; otherwise keep existing or randomize),
-# then filter to the visible subset on every run to react to the toggle.
+# -----------------------------------------------------------------------------
+# Order and visibility
+# -----------------------------------------------------------------------------
 def _make_base_order() -> List[str]:
     meta_order = _restore_order_from_meta(raw_data, ids_all)
     if meta_order is not None:
@@ -211,27 +206,41 @@ def _make_base_order() -> List[str]:
 if "base_order" not in st.session_state or set(st.session_state.base_order) != set(ids_all):
     st.session_state.base_order = _make_base_order()
 
-# The working order is the visible slice of the base order
+# sticky_id keeps the currently scored item visible even if completed
+if "sticky_id" not in st.session_state:
+    st.session_state.sticky_id = None
+
+def _toggle_hide_completed():
+    st.session_state.page = 0
+    st.session_state.sticky_id = None
+
+if "hide_completed" not in st.session_state:
+    st.session_state.hide_completed = True
+hide_completed = st.checkbox(
+    "Show only unscored items",
+    value=st.session_state.hide_completed,
+    key="hide_completed",
+    on_change=_toggle_hide_completed,
+)
+
+# Compute visibility (always include sticky_id even if completed)
+completed_keys = {k for k in st.session_state.scores if k in ids_all and _is_valid_score(st.session_state.scores[k])}
+def _is_visible(i: str) -> bool:
+    if not hide_completed:
+        return True
+    return (i not in completed_keys) or (i == st.session_state.sticky_id)
+
+visible_ids = [i for i in ids_all if _is_visible(i)]
+
+# Working order is the visible slice of the base order
 working_order = [i for i in st.session_state.base_order if i in visible_ids]
 
-# Page index initialization and clamping
+# Page index initialization
 if ("page" not in st.session_state) or st.session_state.get("resume_now"):
-    # When resuming, jump to first unscored in the full base order if showing all,
-    # otherwise start at first in the visible list.
-    if hide_completed:
-        st.session_state.page = 0
-    else:
-        st.session_state.page = _first_unscored(st.session_state.base_order, st.session_state.scores)
-        # Map that index into the working order
-        if working_order:
-            target_id = st.session_state.base_order[st.session_state.page]
-            if target_id in working_order:
-                st.session_state.page = working_order.index(target_id)
-            else:
-                st.session_state.page = 0
+    st.session_state.page = 0 if hide_completed else _first_unscored(st.session_state.base_order, st.session_state.scores)
     st.session_state["resume_now"] = False
 
-# Clamp page if list shrank due to toggling
+# Clamp page
 if working_order:
     st.session_state.page = max(0, min(st.session_state.page, len(working_order) - 1))
 
@@ -268,38 +277,46 @@ if not working_order:
 # Main UI (driven by working_order / visible subset)
 # -----------------------------------------------------------------------------
 options = [0.0, 0.5, 1.0]
-
 current_id = working_order[st.session_state.page]
 payload = payloads_all.get(current_id, current_id)
 
-st.subheader(f"Item {st.session_state.page + 1}/{len(working_order)} ")
-_ = _render_payload(payload)
+st.subheader(f"Item {st.session_state.page + 1}/{len(working_order)}")
+_render_payload(payload)
 
-try:
-    default_idx = options.index(float(st.session_state.scores.get(current_id, 0.0)))
-except Exception:
-    default_idx = 0
+# Scoring (no auto-advance). Keep current item sticky so it stays visible.
+def _set_score(item_id: str):
+    val = st.session_state[f"score_{item_id}"]
+    st.session_state.scores[item_id] = float(val)
+    st.session_state.sticky_id = item_id  # keep it visible after scoring
 
-score = st.radio(
+# default selection
+default_value = float(st.session_state.scores.get(current_id, 0.0))
+st.radio(
     label="Score",
     options=options,
-    index=default_idx,
+    index=options.index(default_value),
     horizontal=True,
     key=f"score_{current_id}",
+    on_change=_set_score,
+    args=(current_id,),
 )
-st.session_state.scores[current_id] = float(score)
 
-def next_page():
-    if st.session_state.page < len(working_order) - 1:
-        st.session_state.page += 1
+# Ensure dict has value on first render too
+if current_id not in st.session_state.scores:
+    st.session_state.scores[current_id] = default_value
 
-def prev_page():
-    if st.session_state.page > 0:
-        st.session_state.page -= 1
+# Navigation: clear stickiness when you move, so completed items can disappear later.
+def _next_page():
+    st.session_state.sticky_id = None
+    st.session_state.page = st.session_state.page + 1
+
+def _prev_page():
+    st.session_state.sticky_id = None
+    st.session_state.page = st.session_state.page - 1
 
 nav_prev, nav_middle, nav_next = st.columns([1, 2, 1])
 with nav_prev:
-    st.button("Previous", on_click=prev_page, disabled=st.session_state.page == 0)
+    st.button("Previous", on_click=_prev_page, disabled=st.session_state.page <= 0)
 with nav_middle:
     completed_total = len(completed_keys)
     st.write(
@@ -307,10 +324,11 @@ with nav_middle:
         f"Completed: {completed_total}/{len(ids_all)}"
     )
 with nav_next:
-    st.button("Next", on_click=next_page, disabled=st.session_state.page >= len(working_order) - 1)
+    st.button("Next", on_click=_next_page, disabled=st.session_state.page >= len(working_order) - 1)
 
-if st.session_state.page == len(working_order) - 1:
-    st.success("Reached the last visible item. Use Download to save your results.")
+# Final clamp
+if working_order:
+    st.session_state.page = max(0, min(st.session_state.page, len(working_order) - 1))
 
 st.markdown("---")
 
@@ -323,7 +341,6 @@ export = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "count": len(ids_all),
         "valid_scores": [0, 0.5, 1],
-        # Save the base order (full set) so a resume can reconstruct exactly
         "order": st.session_state.base_order,
     },
     "items_payloads": payloads_all,
