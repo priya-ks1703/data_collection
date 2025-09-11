@@ -346,6 +346,7 @@ export = {
     "items_payloads": payloads_all,
 }
 
+st.caption("Progress is saved until the item you currently see. So if you do not rate the current item, it is saved as 0.")
 st.download_button(
     label="Download progress (JSON)",
     data=_json_dumps(export),
