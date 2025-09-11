@@ -1,16 +1,21 @@
 import io
 import json
 import random
+import hashlib
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Union
 
 import streamlit as st
 
+# -----------------------------------------------------------------------------
+# App setup
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="JSON Scoring App", layout="wide")
 st.title("JSON Scoring App: choose 0 / 0.5 / 1 per item")
-st.write("This app loads items from a predefined JSON file (`input_texts.json`) the first time. You can also press a button to upload a saved progress file to continue.")
-st.write("""Prompt:
-
+st.write("Load from `input_texts.json` or upload a saved progress file to continue.")
+st.write(
+    """Prompt:
+         
 You are a visionary researcher in quantum optics. You lead a team of scientists and want to provide ideas for them. Your team constists of theoretical quantum optics researchers who are amazing in taking your ideas and creating wonderful stand-alone proposals for experiments. The stand-alone proposals created by your team members are often published in top-journals such as Phys.Rev.Lett. (PRL). That requires that the idea is scientifically novel and concrete proposals from your ideas should be interesting for individual experts in the field or the field of quantum physics researchers as a whole.
 
 Your team is especially exceptionally good in executing your ideas to fully detailed experimental proposals if your ideas are targeted for the following domain:
@@ -23,7 +28,9 @@ Thought: (the reasoning behind the idea)
          
 Final idea: (the actual idea if you are happy with it)
          
-Do not add any other text. Do not output multiple Thoughts and Final ideas.""")
+Do not add any other text. Do not output multiple Thoughts and Final ideas."""
+)
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -44,28 +51,20 @@ def _json_dumps(obj: Any) -> bytes:
 
 
 def _normalize_raw(raw: Any) -> Tuple[List[str], Dict[str, float], Dict[str, Payload]]:
-    """Return (ids, prefilled_scores, payload_map).
-    - Supports three shapes:
-      1) Progress export: {"scores": {...}, "meta": {...}, "items_payloads": {...}}
-      2) Dict input: keys become ids; payload is value; if value is None, payload is key
-      3) List input:
-         - list of primitives: id == str(item), payload == item
-         - list of complex items: id == item_{i}, payload == element
-      4) Other: single id 'item_0' with str(raw) as payload
-    """
+    """Return (ids, prefilled_scores, payload_map)."""
     # Case 1: our own export format
     if isinstance(raw, dict) and "scores" in raw and isinstance(raw["scores"], dict):
-        ids = list(raw["scores"].keys())
         prefilled = {k: float(v) for k, v in raw["scores"].items() if _is_valid_score(v)}
-        payloads = {}
-        if isinstance(raw.get("items_payloads"), dict):
-            payloads = raw["items_payloads"]
+        items_payloads = raw.get("items_payloads")
+        if isinstance(items_payloads, dict) and len(items_payloads) > 0:
+            ids = list(items_payloads.keys())  # full set of items from payloads
+            payloads = items_payloads
         else:
-            # Fallback: show ids as text if no payloads embedded
+            ids = list(prefilled.keys())
             payloads = {k: k for k in ids}
         return ids, prefilled, payloads
 
-    # Case 2: dict input -> ids are keys; payloads are values (or key itself if value is None)
+    # Case 2: dict input
     if isinstance(raw, dict):
         ids = list(raw.keys())
         payloads = {k: (raw[k] if raw[k] is not None else k) for k in ids}
@@ -98,54 +97,79 @@ def _restore_order_from_meta(raw: Any, ids: List[str]) -> List[str] | None:
 
 
 def _render_payload(payload: Payload) -> None:
-    """Display the payload without altering its internal order/content."""
     if isinstance(payload, (str, int, float, bool)):
         st.write(str(payload))
     elif isinstance(payload, list):
-        # If it's a list of primitives, show joined; otherwise pretty-print JSON
         if all(isinstance(x, (str, int, float, bool)) for x in payload):
             st.write(" ".join(str(x) for x in payload))
         else:
             st.code(json.dumps(payload, ensure_ascii=False, indent=2))
     elif isinstance(payload, dict):
-        # Prefer common text fields if present
         for key in ("text", "content", "sentence", "value"):
             if key in payload and isinstance(payload[key], (str, int, float)):
                 st.write(str(payload[key]))
                 return
-        # Otherwise pretty-print JSON (dict insertion order is preserved in Python 3.7+)
         st.code(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         st.write(str(payload))
 
 
+def _first_unscored(order: List[str], scores: Dict[str, float]) -> int:
+    for i, k in enumerate(order):
+        if k not in scores:
+            return i
+    return max(0, len(order) - 1)
+
+
 # -----------------------------------------------------------------------------
-# Load input (file by default) and optional resume via button-triggered upload
+# Load input (file by default) and allow resume via uploader; persist in session
 # -----------------------------------------------------------------------------
 INPUT_JSON_PATH = "input_texts.json"
-raw_data: Any = None
 
-# Default: load from file
-try:
-    with open(INPUT_JSON_PATH, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
-except FileNotFoundError:
-    st.warning(f"Input file not found: {INPUT_JSON_PATH}. You can upload a progress JSON instead.")
-except Exception as e:
-    st.error(f"Could not parse JSON from {INPUT_JSON_PATH}: {e}")
+# Load from session first
+raw_data: Any = st.session_state.get("raw_data", None)
 
-# Button + uploader for resume
-if st.button("Upload progress file to continue"):
-    uploaded = st.file_uploader("Choose a progress JSON", type=["json"], key="resume_upload")
-    if uploaded is not None:
-        try:
-            raw_data = json.load(uploaded)
+# Default file (only if nothing in session)
+if raw_data is None:
+    try:
+        with open(INPUT_JSON_PATH, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+        st.info(f"Loaded input from: {INPUT_JSON_PATH}")
+        st.session_state["raw_data"] = raw_data
+        st.session_state["source"] = INPUT_JSON_PATH
+    except FileNotFoundError:
+        st.warning(f"Input file not found: {INPUT_JSON_PATH}. You can upload a progress JSON instead.")
+    except Exception as e:
+        st.error(f"Could not parse JSON from {INPUT_JSON_PATH}: {e}")
+
+# --- Upload handling: process only when a NEW file is selected (no rerun loops)
+uploaded = st.file_uploader(
+    "Upload a progress JSON to continue (optional)", type=["json"], key="resume_upload"
+)
+
+if uploaded is not None:
+    try:
+        uploaded_bytes = uploaded.getvalue()
+        uploaded_hash = hashlib.md5(uploaded_bytes).hexdigest()
+
+        if st.session_state.get("uploaded_hash") != uploaded_hash:
+            # New file selected -> process once
+            raw = json.loads(uploaded_bytes.decode("utf-8"))
+            st.session_state["uploaded_hash"] = uploaded_hash
+            st.session_state["raw_data"] = raw
+            raw_data = raw
+
+            # Reset/merge scores from upload; jump to next unscored ONCE
+            st.session_state["scores"] = {}
+            st.session_state["resume_now"] = True
+            st.session_state["source"] = "uploaded progress"
             st.success("Loaded uploaded progress JSON.")
-        except Exception as e:
-            st.error(f"Could not parse uploaded JSON: {e}")
+        # If same file remains selected on reruns, do nothing (no page reset)
+    except Exception as e:
+        st.error(f"Could not parse uploaded JSON: {e}")
 
 # -----------------------------------------------------------------------------
-# Prepare items, payloads, and randomized order
+# Prepare items, payloads, and order
 # -----------------------------------------------------------------------------
 ids: List[str] = []
 prefilled: Dict[str, float] = {}
@@ -160,7 +184,7 @@ if not ids:
 
 st.success(f"Loaded {len(ids)} items.")
 
-# Establish non-repeating random order
+# Order (restore from meta if possible; otherwise keep existing or randomize)
 if "order" not in st.session_state or set(st.session_state.order) != set(ids) or len(st.session_state.order) != len(ids):
     meta_order = _restore_order_from_meta(raw_data, ids)
     if meta_order is not None:
@@ -169,20 +193,21 @@ if "order" not in st.session_state or set(st.session_state.order) != set(ids) or
         st.session_state.order = random.sample(ids, k=len(ids))
 
 # -----------------------------------------------------------------------------
-# Main UI (paged over randomized ids)
+# Main UI
 # -----------------------------------------------------------------------------
 options = [0.0, 0.5, 1.0]
 
 if "scores" not in st.session_state:
     st.session_state.scores = {}
 
-# Initialize with prefilled values
+# Merge prefilled scores from input/progress
 for k, v in prefilled.items():
-    st.session_state.scores.setdefault(k, v)
+    st.session_state.scores[k] = v
 
-if "page" not in st.session_state:
-    st.session_state.page = 0
-
+# Auto-jump to first unscored only once after a new upload
+if ("page" not in st.session_state) or st.session_state.get("resume_now"):
+    st.session_state.page = _first_unscored(st.session_state.order, st.session_state.scores)
+    st.session_state["resume_now"] = False  # do not keep forcing resets
 
 def next_page():
     if st.session_state.page < len(st.session_state.order) - 1:
@@ -196,7 +221,7 @@ current_id = st.session_state.order[st.session_state.page]
 payload = payloads.get(current_id, current_id)
 
 st.subheader(f"Item {st.session_state.page + 1}/{len(st.session_state.order)}")
-_render_payload(payload)
+_ = _render_payload(payload)
 
 try:
     default_idx = options.index(float(st.session_state.scores.get(current_id, 0.0)))
@@ -227,7 +252,7 @@ if st.session_state.page == len(st.session_state.order) - 1:
 st.markdown("---")
 
 # -----------------------------------------------------------------------------
-# Export (embed payloads and randomized order so resume shows identical content)
+# Export (embed payloads and order so resume shows identical content)
 # -----------------------------------------------------------------------------
 export = {
     "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids},
@@ -237,7 +262,7 @@ export = {
         "valid_scores": [0, 0.5, 1],
         "order": st.session_state.order,
     },
-    "items_payloads": payloads,  # embed full content to render exactly on resume
+    "items_payloads": payloads,
 }
 
 st.download_button(
@@ -256,4 +281,5 @@ st.download_button(
     mime="application/json",
 )
 
-st.caption("Items are shown in a randomized, non-repeating order. Upload a saved progress file to resume with the same order and content.")
+source = st.session_state.get("source", "unknown")
+st.caption(f"Source: {source}. Items are shown in a randomized order (or restored from uploaded progress).")
