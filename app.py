@@ -57,7 +57,7 @@ def _normalize_raw(raw: Any) -> Tuple[List[str], Dict[str, float], Dict[str, Pay
         prefilled = {k: float(v) for k, v in raw["scores"].items() if _is_valid_score(v)}
         items_payloads = raw.get("items_payloads")
         if isinstance(items_payloads, dict) and len(items_payloads) > 0:
-            ids = list(items_payloads.keys())  # full set of items from payloads
+            ids = list(items_payloads.keys())
             payloads = items_payloads
         else:
             ids = list(prefilled.keys())
@@ -118,7 +118,7 @@ def _first_unscored(order: List[str], scores: Dict[str, float]) -> int:
     for i, k in enumerate(order):
         if k not in scores:
             return i
-    return max(0, len(order) - 1)
+    return 0 if order else 0
 
 
 # -----------------------------------------------------------------------------
@@ -142,7 +142,7 @@ if raw_data is None:
     except Exception as e:
         st.error(f"Could not parse JSON from {INPUT_JSON_PATH}: {e}")
 
-# --- Upload handling: process only when a NEW file is selected (no rerun loops)
+# Upload handling: process only when a new file is selected
 uploaded = st.file_uploader(
     "Upload a progress JSON to continue (optional)", type=["json"], key="resume_upload"
 )
@@ -153,23 +153,22 @@ if uploaded is not None:
         uploaded_hash = hashlib.md5(uploaded_bytes).hexdigest()
 
         if st.session_state.get("uploaded_hash") != uploaded_hash:
-            # New file selected -> process once
             raw = json.loads(uploaded_bytes.decode("utf-8"))
             st.session_state["uploaded_hash"] = uploaded_hash
             st.session_state["raw_data"] = raw
             raw_data = raw
 
-            # Reset/merge scores from upload; jump to next unscored ONCE
+            # Reset scores from upload; jump to next unscored once
             st.session_state["scores"] = {}
             st.session_state["resume_now"] = True
             st.session_state["source"] = "uploaded progress"
             st.success("Loaded uploaded progress JSON.")
-        # If same file remains selected on reruns, do nothing (no page reset)
+        # same file on reruns -> do nothing
     except Exception as e:
         st.error(f"Could not parse uploaded JSON: {e}")
 
 # -----------------------------------------------------------------------------
-# Prepare items, payloads, and order
+# Prepare items, payloads
 # -----------------------------------------------------------------------------
 ids: List[str] = []
 prefilled: Dict[str, float] = {}
@@ -184,43 +183,96 @@ if not ids:
 
 st.success(f"Loaded {len(ids)} items.")
 
-# Order (restore from meta if possible; otherwise keep existing or randomize)
-if "order" not in st.session_state or set(st.session_state.order) != set(ids) or len(st.session_state.order) != len(ids):
-    meta_order = _restore_order_from_meta(raw_data, ids)
-    if meta_order is not None:
-        st.session_state.order = meta_order
-    else:
-        st.session_state.order = random.sample(ids, k=len(ids))
+# Keep full sets for export
+ids_all = ids
+payloads_all = payloads
 
-# -----------------------------------------------------------------------------
-# Main UI
-# -----------------------------------------------------------------------------
-options = [0.0, 0.5, 1.0]
-
+# Scores state
 if "scores" not in st.session_state:
     st.session_state.scores = {}
-
-# Merge prefilled scores from input/progress
+# Merge prefilled from file or upload
 for k, v in prefilled.items():
     st.session_state.scores[k] = v
 
-# Auto-jump to first unscored only once after a new upload
+# Visibility toggle
+hide_completed = st.checkbox("Show only unscored items", value=True)
+
+completed_keys = set(k for k in st.session_state.scores if k in ids_all)
+visible_ids = [i for i in ids_all if (i not in completed_keys) or not hide_completed]
+
+# Order (restore from meta if possible; otherwise keep existing or randomize),
+# then filter to the visible subset on every run to react to the toggle.
+def _make_base_order() -> List[str]:
+    meta_order = _restore_order_from_meta(raw_data, ids_all)
+    if meta_order is not None:
+        return meta_order
+    return random.sample(ids_all, k=len(ids_all))
+
+if "base_order" not in st.session_state or set(st.session_state.base_order) != set(ids_all):
+    st.session_state.base_order = _make_base_order()
+
+# The working order is the visible slice of the base order
+working_order = [i for i in st.session_state.base_order if i in visible_ids]
+
+# Page index initialization and clamping
 if ("page" not in st.session_state) or st.session_state.get("resume_now"):
-    st.session_state.page = _first_unscored(st.session_state.order, st.session_state.scores)
-    st.session_state["resume_now"] = False  # do not keep forcing resets
+    # When resuming, jump to first unscored in the full base order if showing all,
+    # otherwise start at first in the visible list.
+    if hide_completed:
+        st.session_state.page = 0
+    else:
+        st.session_state.page = _first_unscored(st.session_state.base_order, st.session_state.scores)
+        # Map that index into the working order
+        if working_order:
+            target_id = st.session_state.base_order[st.session_state.page]
+            if target_id in working_order:
+                st.session_state.page = working_order.index(target_id)
+            else:
+                st.session_state.page = 0
+    st.session_state["resume_now"] = False
 
-def next_page():
-    if st.session_state.page < len(st.session_state.order) - 1:
-        st.session_state.page += 1
+# Clamp page if list shrank due to toggling
+if working_order:
+    st.session_state.page = max(0, min(st.session_state.page, len(working_order) - 1))
 
-def prev_page():
-    if st.session_state.page > 0:
-        st.session_state.page -= 1
+# If nothing visible, show completion state and export
+if not working_order:
+    st.success("All items are completed. You can download your progress below.")
+    export = {
+        "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids_all},
+        "meta": {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "count": len(ids_all),
+            "valid_scores": [0, 0.5, 1],
+            "order": st.session_state.base_order,
+        },
+        "items_payloads": payloads_all,
+    }
+    st.download_button(
+        label="Download progress (JSON)",
+        data=_json_dumps(export),
+        file_name="progress.json",
+        mime="application/json",
+        key="download_progress_all_done",
+    )
+    filename = f"scores_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    st.download_button(
+        label="Download JSON",
+        data=_json_dumps(export),
+        file_name=filename,
+        mime="application/json",
+    )
+    st.stop()
 
-current_id = st.session_state.order[st.session_state.page]
-payload = payloads.get(current_id, current_id)
+# -----------------------------------------------------------------------------
+# Main UI (driven by working_order / visible subset)
+# -----------------------------------------------------------------------------
+options = [0.0, 0.5, 1.0]
 
-st.subheader(f"Item {st.session_state.page + 1}/{len(st.session_state.order)}")
+current_id = working_order[st.session_state.page]
+payload = payloads_all.get(current_id, current_id)
+
+st.subheader(f"Item {st.session_state.page + 1}/{len(working_order)} ")
 _ = _render_payload(payload)
 
 try:
@@ -237,32 +289,44 @@ score = st.radio(
 )
 st.session_state.scores[current_id] = float(score)
 
+def next_page():
+    if st.session_state.page < len(working_order) - 1:
+        st.session_state.page += 1
+
+def prev_page():
+    if st.session_state.page > 0:
+        st.session_state.page -= 1
+
 nav_prev, nav_middle, nav_next = st.columns([1, 2, 1])
 with nav_prev:
     st.button("Previous", on_click=prev_page, disabled=st.session_state.page == 0)
 with nav_middle:
-    completed = sum(1 for k in st.session_state.order if k in st.session_state.scores)
-    st.write(f"Page {st.session_state.page + 1} / {len(st.session_state.order)} · Completed: {completed}/{len(st.session_state.order)}")
+    completed_total = len(completed_keys)
+    st.write(
+        f"Page {st.session_state.page + 1} / {len(working_order)} · "
+        f"Completed: {completed_total}/{len(ids_all)}"
+    )
 with nav_next:
-    st.button("Next", on_click=next_page, disabled=st.session_state.page >= len(st.session_state.order) - 1)
+    st.button("Next", on_click=next_page, disabled=st.session_state.page >= len(working_order) - 1)
 
-if st.session_state.page == len(st.session_state.order) - 1:
-    st.success("Reached the last item. Use Download to save your results.")
+if st.session_state.page == len(working_order) - 1:
+    st.success("Reached the last visible item. Use Download to save your results.")
 
 st.markdown("---")
 
 # -----------------------------------------------------------------------------
-# Export (embed payloads and order so resume shows identical content)
+# Export (embed payloads and base order so resume shows identical content)
 # -----------------------------------------------------------------------------
 export = {
-    "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids},
+    "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids_all},
     "meta": {
         "generated_at": datetime.utcnow().isoformat() + "Z",
-        "count": len(ids),
+        "count": len(ids_all),
         "valid_scores": [0, 0.5, 1],
-        "order": st.session_state.order,
+        # Save the base order (full set) so a resume can reconstruct exactly
+        "order": st.session_state.base_order,
     },
-    "items_payloads": payloads,
+    "items_payloads": payloads_all,
 }
 
 st.download_button(
@@ -282,4 +346,3 @@ st.download_button(
 )
 
 source = st.session_state.get("source", "unknown")
-st.caption(f"Source: {source}. Items are shown in a randomized order (or restored from uploaded progress).")
