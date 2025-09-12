@@ -313,18 +313,11 @@ remaining = len([k for k in ids_all if k not in completed_keys])
 st.subheader(f"Item {position}/{total}")
 _render_payload(payload)
 
-# Scoring (auto-advance to next visible when hiding completed)
 def _set_score(item_id: str):
     val = st.session_state[f"score_{item_id}"]
     st.session_state.scores[item_id] = float(val)
-    if st.session_state.get("hide_completed", True):
-        # Do not keep completed item sticky; let it disappear
-        st.session_state.sticky_id = None
-        # Move to the next visible index (prevents getting stuck at last visible)
-        st.session_state.page = _next_visible_index(st.session_state.page)
-    else:
-        # When showing all, keep it sticky to avoid jumpiness
-        st.session_state.sticky_id = item_id
+    # Keep the current item visible so it does not disappear when hiding completed
+    st.session_state.sticky_id = item_id
 
 # default selection
 options = [0.0, 0.5, 1.0]
@@ -339,9 +332,6 @@ st.radio(
     args=(current_id,),
 )
 
-# Ensure dict has value on first render too
-if current_id not in st.session_state.scores:
-    st.session_state.scores[current_id] = default_value
 
 # Navigation: move across visible items while indexing base_order
 def _next_page():
@@ -372,7 +362,7 @@ st.markdown("---")
 # Export (embed payloads and base order so resume shows identical content)
 # -----------------------------------------------------------------------------
 export = {
-    "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids_all},
+    "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids_all and k != current_id},
     "meta": {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "count": len(ids_all),
@@ -382,7 +372,6 @@ export = {
     "items_payloads": payloads_all,
 }
 
-st.caption("Progress is saved until the item you currently see. So if you do not rate the current item, it is saved as 0.")
 st.download_button(
     label="Download progress (JSON)",
     data=_json_dumps(export),
