@@ -45,6 +45,9 @@ def _is_valid_score(v: Any) -> bool:
     except Exception:
         return False
 
+def _ensure_scored(item_id: str):
+    if item_id not in st.session_state.scores or not _is_valid_score(st.session_state.scores[item_id]):
+        st.session_state.scores[item_id] = 0.0
 
 def _json_dumps(obj: Any) -> bytes:
     return json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8")
@@ -335,10 +338,12 @@ st.radio(
 
 # Navigation: move across visible items while indexing base_order
 def _next_page():
+    _ensure_scored(st.session_state.base_order[st.session_state.page])
     st.session_state.sticky_id = None
     st.session_state.page = _next_visible_index(st.session_state.page)
 
 def _prev_page():
+    _ensure_scored(st.session_state.base_order[st.session_state.page])
     st.session_state.sticky_id = None
     st.session_state.page = _prev_visible_index(st.session_state.page)
 
