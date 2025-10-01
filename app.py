@@ -1,396 +1,319 @@
+# app.py
 import io
-import json
-import random
-import hashlib
+import re
+import csv
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, Union
+from typing import List, Dict, Tuple, Optional
 
 import streamlit as st
+from pathlib import Path
 
-# -----------------------------------------------------------------------------
-# App setup
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="JSON Scoring App", layout="wide")
-st.title("JSON Scoring App: choose 0 / 0.5 / 1 per item")
-st.write("Load from `input_texts.json` or upload a saved progress file to continue.")
-st.write(
-    """Prompt:
-         
-You are a visionary researcher in quantum optics. You lead a team of scientists and want to provide ideas for them. Your team constists of theoretical quantum optics researchers who are amazing in taking your ideas and creating wonderful stand-alone proposals for experiments. The stand-alone proposals created by your team members are often published in top-journals such as Phys.Rev.Lett. (PRL). That requires that the idea is scientifically novel and concrete proposals from your ideas should be interesting for individual experts in the field or the field of quantum physics researchers as a whole.
+# =========================
+# Configure your file paths
+# =========================
+PROMPTS_PATH = Path("data/original.csv")          # col1=index, col2=model, col3=prompt
+COMPARISONS_PATH = Path("data/judge_responses.txt")  # TXT with "RANDOMIZED ORDER..." or CSV with a_model/a_index/b_model/b_index
+PROGRESS_PATH: Optional[Path] = None             # e.g., Path("data/progress.csv") to resume; or leave None
+AUTOSAVE_PATH: Optional[Path] = None             # e.g., Path("data/progress_autosave.csv")
 
-Your team is especially exceptionally good in executing your ideas to fully detailed experimental proposals if your ideas are targeted for the following domain:
-
-Concrete quantum networks systems (e.g., generalizations of entanglement swapping, quantum teleportation, etc) and foundational quantum optics experiments. Your ideas should be implementable with probabilistic photon-pair sources (such as SPDC), or probabilistic and deterministic single-photon sources, and standard linear optics elements. Your team cannot design experiments that require dynamic feedback control. If your idea is in that realm, your team will figure out a great way to develop a full proposal.
-
-Respond exactly with the following format:
-         
-Thought: (the reasoning behind the idea)
-         
-Final idea: (the actual idea if you are happy with it)
-         
-Do not add any other text. Do not output multiple Thoughts and Final ideas."""
+# -------- Parsers & helpers -------- #
+PAIR_PATTERN = re.compile(
+    r"RANDOMIZED ORDER:\s*A:\s*(?P<a_model>[A-Za-z0-9_\-]+)\[(?P<a_idx>\d+)\]\s*,\s*B:\s*(?P<b_model>[A-Za-z0-9_\-]+)\[(?P<b_idx>\d+)\]",
+    re.IGNORECASE,
 )
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-Primitive = Union[str, int, float, bool]
-Payload = Union[Primitive, List[Any], Dict[str, Any]]
+def normalize_header(name: str) -> str:
+    return name.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
 
+def read_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="replace")
 
-def _is_valid_score(v: Any) -> bool:
-    try:
-        f = float(v)
-        return f in {0.0, 0.5, 1.0}
-    except Exception:
-        return False
+def load_prompt_csv_from_text(text: str) -> Dict[Tuple[str, int], str]:
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        raise ValueError("Prompts CSV is empty.")
+    first = rows[0]
+    has_header = False
+    if first:
+        c0 = first[0].strip()
+        if not c0 or not c0.isdigit() or "index" in normalize_header(c0):
+            has_header = True
+    data_rows = rows[1:] if has_header else rows
+    mapping: Dict[Tuple[str, int], str] = {}
+    for row in data_rows:
+        if len(row) < 3:
+            continue
+        try:
+            idx = int(row[0].strip())
+        except Exception:
+            continue
+        model = row[1].strip()
+        prompt = row[2]
+        mapping[(model, idx)] = prompt
+    return mapping
 
-def _ensure_scored(item_id: str):
-    if item_id not in st.session_state.scores or not _is_valid_score(st.session_state.scores[item_id]):
-        st.session_state.scores[item_id] = 0.0
+def parse_pairs_txt(txt: str) -> List[Dict]:
+    pairs = []
+    for m in PAIR_PATTERN.finditer(txt):
+        pairs.append({
+            "a_model": m.group("a_model"),
+            "a_idx": int(m.group("a_idx")),
+            "b_model": m.group("b_model"),
+            "b_idx": int(m.group("b_idx")),
+        })
+    for i, p in enumerate(pairs):
+        p["pair_id"] = i
+    return pairs
 
-def _json_dumps(obj: Any) -> bytes:
-    return json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8")
+def parse_pairs_csv(text: str) -> List[Dict]:
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("Comparisons CSV missing header row.")
+    header_map = {normalize_header(h): h for h in reader.fieldnames}
+    def get(row, options):
+        for k in options:
+            if k in header_map:
+                return (row.get(header_map[k]) or "").strip()
+        return ""
+    pairs: List[Dict] = []
+    for row in reader:
+        a_model = get(row, ["amodel", "a", "amodelname"])
+        b_model = get(row, ["bmodel", "b", "bmodelname"])
+        a_idx_s = get(row, ["aindex", "aidx", "a_index", "a_idx"])
+        b_idx_s = get(row, ["bindex", "bidx", "b_index", "b_idx"])
+        if not (a_model and b_model and a_idx_s and b_idx_s):
+            continue
+        try:
+            a_idx = int(a_idx_s); b_idx = int(b_idx_s)
+        except Exception:
+            continue
+        pairs.append({"a_model": a_model, "a_idx": a_idx, "b_model": b_model, "b_idx": b_idx})
+    for i, p in enumerate(pairs):
+        p["pair_id"] = i
+    return pairs
 
+def attach_prompts(pairs: List[Dict], prompt_map: Dict[Tuple[str, int], str]) -> List[Dict]:
+    out = []
+    for p in pairs:
+        out.append({
+            **p,
+            "a_prompt": prompt_map.get((p["a_model"], p["a_idx"])),
+            "b_prompt": prompt_map.get((p["b_model"], p["b_idx"]))
+        })
+    return out
 
-def _normalize_raw(raw: Any) -> Tuple[List[str], Dict[str, float], Dict[str, Payload]]:
-    """Return (ids, prefilled_scores, payload_map)."""
-    # Case 1: our own export format
-    if isinstance(raw, dict) and "scores" in raw and isinstance(raw["scores"], dict):
-        prefilled = {k: float(v) for k, v in raw["scores"].items() if _is_valid_score(v)}
-        items_payloads = raw.get("items_payloads")
-        if isinstance(items_payloads, dict) and len(items_payloads) > 0:
-            ids = list(items_payloads.keys())
-            payloads = items_payloads
+def load_progress_csv(text: str) -> List[Dict]:
+    reader = csv.DictReader(io.StringIO(text))
+    out = []
+    for row in reader:
+        try:
+            pid = int((row.get("pair_id") or "").strip())
+        except Exception:
+            pid = None
+        out.append({
+            "pair_id": pid,
+            "a_model": (row.get("a_model") or "").strip(),
+            "a_index": int((row.get("a_index") or "0").strip() or 0),
+            "b_model": (row.get("b_model") or "").strip(),
+            "b_index": int((row.get("b_index") or "0").strip() or 0),
+            "choice": (row.get("choice") or "").strip(),
+            "timestamp": (row.get("timestamp") or "").strip(),
+        })
+    return out
+
+def merge_existing_choices(pairs: List[Dict], progress: List[Dict]) -> Dict[int, Dict]:
+    by_pair_id, by_sig = {}, {}
+    for r in progress:
+        sig = (r["a_model"], r["a_index"], r["b_model"], r["b_index"])
+        if r["pair_id"] is not None:
+            by_pair_id[r["pair_id"]] = r
+        by_sig[sig] = r
+    choices = {}
+    for p in pairs:
+        sig = (p["a_model"], p["a_idx"], p["b_model"], p["b_idx"])
+        if p["pair_id"] in by_pair_id:
+            choices[p["pair_id"]] = by_pair_id[p["pair_id"]]
+        elif sig in by_sig:
+            choices[p["pair_id"]] = by_sig[sig]
+    return choices
+
+def export_progress_csv(pairs: List[Dict], choices: Dict[int, Dict]) -> bytes:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["pair_id","a_model","a_index","b_model","b_index","choice","timestamp","a_prompt","b_prompt"])
+    for p in pairs:
+        ch = choices.get(p["pair_id"], {})
+        w.writerow([
+            p["pair_id"], p["a_model"], p["a_idx"], p["b_model"], p["b_idx"],
+            ch.get("choice",""), ch.get("timestamp",""),
+            (p.get("a_prompt") or ""), (p.get("b_prompt") or "")
+        ])
+    return buf.getvalue().encode("utf-8")
+
+def first_unanswered_index(pairs: List[Dict], choices: Dict[int, Dict]) -> int:
+    for p in pairs:
+        if p["pair_id"] not in choices or not choices[p["pair_id"]].get("choice"):
+            return p["pair_id"]
+    return len(pairs)
+
+def autosave_if_enabled(pairs, choices):
+    if AUTOSAVE_PATH:
+        AUTOSAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AUTOSAVE_PATH.write_bytes(export_progress_csv(pairs, choices))
+
+# -------- UI -------- #
+st.set_page_config(page_title="A/B Prompt Chooser", page_icon="🗂️", layout="wide")
+st.title("A/B Prompt Chooser")
+
+# Session state
+if "pairs" not in st.session_state: st.session_state.pairs = []
+if "choices" not in st.session_state: st.session_state.choices = {}
+if "current" not in st.session_state: st.session_state.current = 0
+if "uploaded_progress_text" not in st.session_state: st.session_state.uploaded_progress_text = None
+
+# In-page progress upload (optional). If provided, it overrides PROGRESS_PATH.
+st.markdown("#### Continue from a progress file (optional)")
+prog_upload = st.file_uploader("Upload progress CSV to resume", type=["csv"], key="progress_uploader_main")
+if prog_upload is not None:
+    st.session_state.uploaded_progress_text = prog_upload.read().decode("utf-8", errors="replace")
+
+# ===== Auto-load data (no button) =====
+def build_or_refresh_state():
+    # Must have prompts and comparisons available by default
+    if not PROMPTS_PATH.exists():
+        st.error(f"Prompts file not found: {PROMPTS_PATH}")
+        st.stop()
+    if not COMPARISONS_PATH.exists():
+        st.error(f"Comparisons file not found: {COMPARISONS_PATH}")
+        st.stop()
+
+    # Load prompts
+    prompt_map = load_prompt_csv_from_text(read_text(PROMPTS_PATH))
+
+    # Load comparisons (TXT or CSV)
+    comp_text = read_text(COMPARISONS_PATH)
+    pairs: List[Dict] = []
+    if COMPARISONS_PATH.suffix.lower() == ".csv":
+        try:
+            pairs = parse_pairs_csv(comp_text)
+        except Exception:
+            pairs = []
+    if not pairs:
+        pairs = parse_pairs_txt(comp_text) or parse_pairs_csv(comp_text)
+
+    if not pairs:
+        st.error("No pairs found in comparisons file.")
+        st.stop()
+
+    pairs = attach_prompts(pairs, prompt_map)
+
+    # Merge progress:
+    merged_from_file: Dict[int, Dict] = {}
+    if st.session_state.uploaded_progress_text:
+        try:
+            existing = load_progress_csv(st.session_state.uploaded_progress_text)
+            merged_from_file = merge_existing_choices(pairs, existing)
+            st.success(f"Loaded prior progress (uploaded): {len([r for r in merged_from_file.values() if r.get('choice')])}")
+        except Exception as e:
+            st.warning(f"Could not read uploaded progress: {e}")
+    elif PROGRESS_PATH and PROGRESS_PATH.exists():
+        try:
+            existing = load_progress_csv(read_text(PROGRESS_PATH))
+            merged_from_file = merge_existing_choices(pairs, existing)
+            st.success(f"Loaded prior progress (file): {len([r for r in merged_from_file.values() if r.get('choice')])}")
+        except Exception as e:
+            st.warning(f"Could not read progress file: {e}")
+
+    # Keep any in-session choices (take precedence over file)
+    choices = {**merged_from_file, **st.session_state.get("choices", {})}
+
+    st.session_state.pairs = pairs
+    st.session_state.choices = choices
+    st.session_state.current = first_unanswered_index(pairs, choices)
+
+# Always refresh the working set automatically (no button)
+build_or_refresh_state()
+
+pairs = st.session_state.pairs
+choices = st.session_state.choices
+current = st.session_state.current
+
+# ===== Main panel =====
+if current >= len(pairs):
+    st.success("All pairs completed. You can still download your progress.")
+else:
+    p = pairs[current]
+    # st.subheader(f"Pair {current + 1} of {len(pairs)}")
+    # c1, c2, c3 = st.columns(3)
+    # with c1: st.write(f"**A:** {p['a_model']}[{p['a_idx']}]")
+    # with c2: st.write(f"**B:** {p['b_model']}[{p['b_idx']}]")
+    # with c3: st.write(f"**Pair ID:** {p['pair_id']}")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("### A")
+        if p.get("a_prompt") is None:
+            st.error(f"Prompt not found for {p['a_model']}[{p['a_idx']}] in CSV.")
         else:
-            ids = list(prefilled.keys())
-            payloads = {k: k for k in ids}
-        return ids, prefilled, payloads
-
-    # Case 2: dict input
-    if isinstance(raw, dict):
-        ids = list(raw.keys())
-        payloads = {k: (raw[k] if raw[k] is not None else k) for k in ids}
-        return ids, {}, payloads
-
-    # Case 3: list input
-    if isinstance(raw, list):
-        if all(isinstance(x, (str, int, float, bool)) for x in raw):
-            ids = [str(x) for x in raw]
-            payloads = {str(x): x for x in raw}
-            return ids, {}, payloads
+            st.text_area("Prompt A", value=p["a_prompt"], height=280, key=f"prompt_a_{current}", label_visibility="collapsed")
+    with col_b:
+        st.markdown("### B")
+        if p.get("b_prompt") is None:
+            st.error(f"Prompt not found for {p['b_model']}[{p['b_idx']}] in CSV.")
         else:
-            ids = [f"item_{i}" for i, _ in enumerate(raw)]
-            payloads = {f"item_{i}": raw[i] for i in range(len(raw))}
-            return ids, {}, payloads
+            st.text_area("Prompt B", value=p["b_prompt"], height=280, key=f"prompt_b_{current}", label_visibility="collapsed")
 
-    # Case 4: fallback single item
-    return ["item_0"], {}, {"item_0": raw}
+    # Only A and B buttons
+    act_cols = st.columns([1, 1])
+    def record_choice(choice_value: str):
+        choices[p["pair_id"]] = {
+            "pair_id": p["pair_id"],
+            "a_model": p["a_model"],
+            "a_index": p["a_idx"],
+            "b_model": p["b_model"],
+            "b_index": p["b_idx"],
+            "choice": choice_value,  # "A" or "B"
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        st.session_state.choices = choices
+        st.session_state.current = first_unanswered_index(pairs, choices)
+        autosave_if_enabled(pairs, choices)
 
-
-def _restore_order_from_meta(raw: Any, ids: List[str]) -> List[str] | None:
-    try:
-        if isinstance(raw, dict) and isinstance(raw.get("meta"), dict):
-            order = raw["meta"].get("order")
-            if isinstance(order, list) and set(order) == set(ids) and len(order) == len(ids):
-                return order
-    except Exception:
-        pass
-    return None
-
-
-def _render_payload(payload: Payload) -> None:
-    if isinstance(payload, (str, int, float, bool)):
-        st.write(str(payload))
-    elif isinstance(payload, list):
-        if all(isinstance(x, (str, int, float, bool)) for x in payload):
-            st.write(" ".join(str(x) for x in payload))
-        else:
-            st.code(json.dumps(payload, ensure_ascii=False, indent=2))
-    elif isinstance(payload, dict):
-        for key in ("text", "content", "sentence", "value"):
-            if key in payload and isinstance(payload[key], (str, int, float)):
-                st.write(str(payload[key]))
-                return
-        st.code(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        st.write(str(payload))
-
-
-def _first_unscored(order: List[str], scores: Dict[str, float]) -> int:
-    for i, k in enumerate(order):
-        if k not in scores:
-            return i
-    return 0
-
-
-# -----------------------------------------------------------------------------
-# Load input (file by default) and allow resume via uploader; persist in session
-# -----------------------------------------------------------------------------
-INPUT_JSON_PATH = "input_texts.json"
-
-# Load from session first
-raw_data: Any = st.session_state.get("raw_data", None)
-
-# Default file (only if nothing in session)
-if raw_data is None:
-    try:
-        with open(INPUT_JSON_PATH, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-        st.info(f"Loaded input from: {INPUT_JSON_PATH}")
-        st.session_state["raw_data"] = raw_data
-        st.session_state["source"] = INPUT_JSON_PATH
-    except FileNotFoundError:
-        st.warning(f"Input file not found: {INPUT_JSON_PATH}. You can upload a progress JSON instead.")
-    except Exception as e:
-        st.error(f"Could not parse JSON from {INPUT_JSON_PATH}: {e}")
-
-# Upload handling: process only when a new file is selected
-uploaded = st.file_uploader(
-    "Upload a progress JSON to continue (optional)", type=["json"], key="resume_upload"
-)
-
-if uploaded is not None:
-    try:
-        uploaded_bytes = uploaded.getvalue()
-        uploaded_hash = hashlib.md5(uploaded_bytes).hexdigest()
-
-        if st.session_state.get("uploaded_hash") != uploaded_hash:
-            raw = json.loads(uploaded_bytes.decode("utf-8"))
-            st.session_state["uploaded_hash"] = uploaded_hash
-            st.session_state["raw_data"] = raw
-            raw_data = raw
-
-            # Reset scores from upload; jump to next unscored once
-            st.session_state["scores"] = {}
-            st.session_state["resume_now"] = True
-            st.session_state["source"] = "uploaded progress"
-            st.success("Loaded uploaded progress JSON.")
-        # same file on reruns -> do nothing
-    except Exception as e:
-        st.error(f"Could not parse uploaded JSON: {e}")
-
-# -----------------------------------------------------------------------------
-# Prepare items, payloads
-# -----------------------------------------------------------------------------
-ids: List[str] = []
-prefilled: Dict[str, float] = {}
-payloads: Dict[str, Payload] = {}
-
-if raw_data is not None:
-    ids, prefilled, payloads = _normalize_raw(raw_data)
-
-if not ids:
-    st.info("No items found in input JSON.")
-    st.stop()
-
-st.success(f"Loaded {len(ids)} items.")
-
-# Keep full sets for export
-ids_all = ids
-payloads_all = payloads
-
-# Scores state
-if "scores" not in st.session_state:
-    st.session_state.scores = {}
-# Merge prefilled from file or upload
-for k, v in prefilled.items():
-    st.session_state.scores[k] = v
-
-# -----------------------------------------------------------------------------
-# Order (stable) and visibility helpers
-# -----------------------------------------------------------------------------
-def _make_base_order() -> List[str]:
-    meta_order = _restore_order_from_meta(raw_data, ids_all)
-    if meta_order is not None:
-        return meta_order
-    return random.sample(ids_all, k=len(ids_all))
-
-if "base_order" not in st.session_state or set(st.session_state.base_order) != set(ids_all):
-    st.session_state.base_order = _make_base_order()
-
-# sticky_id keeps the currently scored item visible even if completed
-if "sticky_id" not in st.session_state:
-    st.session_state.sticky_id = None
-
-if "hide_completed" not in st.session_state:
-    st.session_state.hide_completed = True
-
-def _toggle_hide_completed():
-    # When toggling visibility, move to the first visible item
-    st.session_state.page = 0
-    st.session_state.sticky_id = None
-    st.session_state["resume_now"] = True  # force jump to first visible on next block
-
-hide_completed = st.checkbox(
-    "Show only unscored items",
-    value=st.session_state.hide_completed,
-    key="hide_completed",
-    on_change=_toggle_hide_completed,
-)
-
-# Compute completed set every run
-completed_keys = {k for k in st.session_state.scores if k in ids_all and _is_valid_score(st.session_state.scores[k])}
-
-def _is_visible(item_id: str) -> bool:
-    if not st.session_state.hide_completed:
-        return True
-    return (item_id not in completed_keys) or (item_id == st.session_state.sticky_id)
-
-def _next_visible_index(i: int) -> int:
-    base = st.session_state.base_order
-    for j in range(i + 1, len(base)):
-        if _is_visible(base[j]):
-            return j
-    return i  # no forward visible item
-
-def _prev_visible_index(i: int) -> int:
-    base = st.session_state.base_order
-    for j in range(i - 1, -1, -1):
-        if _is_visible(base[j]):
-            return j
-    return i  # no backward visible item
-
-def _first_visible_index() -> int:
-    base = st.session_state.base_order
-    for j in range(len(base)):
-        if _is_visible(base[j]):
-            return j
-    return 0
-
-# Page index initialization (always in base_order coordinates)
-if ("page" not in st.session_state) or st.session_state.get("resume_now"):
-    if st.session_state.hide_completed:
-        st.session_state.page = _first_visible_index()
-    else:
-        st.session_state.page = _first_unscored(st.session_state.base_order, st.session_state.scores)
-    st.session_state["resume_now"] = False
-
-# If nothing visible, show completion state and export
-any_visible = any(_is_visible(i) for i in st.session_state.base_order)
-if not any_visible:
-    st.success("All items are completed. You can download your progress below.")
-    export = {
-        "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids_all},
-        "meta": {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "count": len(ids_all),
-            "valid_scores": [0, 0.5, 1],
-            "order": st.session_state.base_order,
-        },
-        "items_payloads": payloads_all,
-    }
-    st.download_button(
-        label="Download progress (JSON)",
-        data=_json_dumps(export),
-        file_name="progress.json",
-        mime="application/json",
-        key="download_progress_all_done",
-    )
-    filename = f"scores_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    st.download_button(
-        label="Download JSON",
-        data=_json_dumps(export),
-        file_name=filename,
-        mime="application/json",
-    )
-    st.stop()
-
-# -----------------------------------------------------------------------------
-# Main UI (driven by base_order + visibility)
-# -----------------------------------------------------------------------------
-idx = st.session_state.page
-# Clamp idx to a visible item (in case data changed)
-if not _is_visible(st.session_state.base_order[idx]):
-    idx = _first_visible_index()
-    st.session_state.page = idx
-
-current_id = st.session_state.base_order[idx]
-payload = payloads_all.get(current_id, current_id)
-
-# Stable position info
-total = len(st.session_state.base_order)
-position = st.session_state.base_order.index(current_id) + 1
-remaining = len([k for k in ids_all if k not in completed_keys])
-
-st.subheader(f"Item {position}/{total}")
-_render_payload(payload)
-
-def _set_score(item_id: str):
-    val = st.session_state[f"score_{item_id}"]
-    st.session_state.scores[item_id] = float(val)
-    # Keep the current item visible so it does not disappear when hiding completed
-    st.session_state.sticky_id = item_id
-
-# default selection
-options = [0.0, 0.5, 1.0]
-default_value = float(st.session_state.scores.get(current_id, 0.0))
-st.radio(
-    label="Score",
-    options=options,
-    index=options.index(default_value),
-    horizontal=True,
-    key=f"score_{current_id}",
-    on_change=_set_score,
-    args=(current_id,),
-)
-
-
-# Navigation: move across visible items while indexing base_order
-def _next_page():
-    _ensure_scored(st.session_state.base_order[st.session_state.page])
-    st.session_state.sticky_id = None
-    st.session_state.page = _next_visible_index(st.session_state.page)
-
-def _prev_page():
-    _ensure_scored(st.session_state.base_order[st.session_state.page])
-    st.session_state.sticky_id = None
-    st.session_state.page = _prev_visible_index(st.session_state.page)
-
-next_disabled = _next_visible_index(st.session_state.page) == st.session_state.page
-prev_disabled = _prev_visible_index(st.session_state.page) == st.session_state.page
-
-nav_prev, nav_middle, nav_next = st.columns([1, 2, 1])
-with nav_prev:
-    st.button("Previous", on_click=_prev_page, disabled=prev_disabled)
-with nav_middle:
-    completed_total = len(completed_keys)
-    st.write(
-        f"Position {position} / {total} · Completed: {completed_total}/{len(ids_all)} · Remaining: {remaining}"
-    )
-with nav_next:
-    st.button("Next", on_click=_next_page, disabled=next_disabled)
+    with act_cols[0]:
+        if st.button("Choose A", use_container_width=True):
+            record_choice("A"); st.rerun()
+    with act_cols[1]:
+        if st.button("Choose B", use_container_width=True):
+            record_choice("B"); st.rerun()
 
 st.markdown("---")
+st.subheader("Progress")
+completed = sum(1 for pid in range(len(pairs)) if choices.get(pid, {}).get("choice"))
+st.write(f"Completed: **{completed} / {len(pairs)}**")
 
-# -----------------------------------------------------------------------------
-# Export (embed payloads and base order so resume shows identical content)
-# -----------------------------------------------------------------------------
-export = {
-    "scores": {k: float(v) for k, v in st.session_state.scores.items() if k in ids_all and k != current_id},
-    "meta": {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "count": len(ids_all),
-        "valid_scores": [0, 0.5, 1],
-        "order": st.session_state.base_order,
-    },
-    "items_payloads": payloads_all,
-}
-
+export_bytes = export_progress_csv(pairs, choices)
 st.download_button(
-    label="Download progress (JSON)",
-    data=_json_dumps(export),
-    file_name="progress.json",
-    mime="application/json",
-    key="download_progress",
+    "Download progress CSV",
+    data=export_bytes,
+    file_name="ab_progress.csv",
+    mime="text/csv",
 )
 
-filename = f"scores_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-st.download_button(
-    label="Download JSON",
-    data=_json_dumps(export),
-    file_name=filename,
-    mime="application/json",
-)
+# if completed:
+#     recent = []
+#     for pid in reversed(range(len(pairs))):
+#         if choices.get(pid, {}).get("choice"):
+#             recent.append({"pair_id": pid, "choice": choices[pid]["choice"]})
+#         if len(recent) >= 10:
+#             break
+#     st.caption("Recent decisions (latest 10):")
+#     st.table(recent)
 
-source = st.session_state.get("source", "unknown")
+# with st.expander("File format notes"):
+#     st.write(
+#         "- **Prompts CSV:** column1=index (int), column2=model (str), column3=prompt (str)\n"
+#         "- **Comparisons TXT:** lines like `RANDOMIZED ORDER: A: gpt[47], B: llama[85]`\n"
+#         "- **Comparisons CSV (alternative):** headers `a_model,a_index,b_model,b_index` (or `a_idx/b_idx`)\n"
+#         "- **Progress CSV:** upload above or set PROGRESS_PATH to resume"
+#     )
