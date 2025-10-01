@@ -163,8 +163,8 @@ def autosave_if_enabled(pairs, choices):
         AUTOSAVE_PATH.write_bytes(export_progress_csv(pairs, choices))
 
 # -------- UI -------- #
-st.set_page_config(page_title="A/B Prompt Chooser", page_icon="🗂️", layout="wide")
-st.title("A/B Prompt Chooser")
+st.set_page_config(page_title="A/B Output Chooser", page_icon="🗂️", layout="wide")
+st.title("A/B Output Chooser")
 
 # Session state
 if "pairs" not in st.session_state: st.session_state.pairs = []
