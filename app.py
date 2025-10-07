@@ -12,7 +12,7 @@ from pathlib import Path
 # Configure your file paths
 # =========================
 PROMPTS_PATH = Path("data/original.csv")          # col1=index, col2=model, col3=prompt
-COMPARISONS_PATH = Path("data/judge_responses.txt")  # TXT with "RANDOMIZED ORDER..." or CSV with a_model/a_index/b_model/b_index
+COMPARISONS_PATH = Path("data/elo_llama_responses.csv")  # TXT with "RANDOMIZED ORDER..." or CSV with a_model/a_index/b_model/b_index
 PROGRESS_PATH: Optional[Path] = None             # e.g., Path("data/progress.csv") to resume; or leave None
 AUTOSAVE_PATH: Optional[Path] = None             # e.g., Path("data/progress_autosave.csv")
 
