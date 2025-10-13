@@ -11,8 +11,8 @@ from pathlib import Path
 # =========================
 # Configure your file paths
 # =========================
-PROMPTS_PATH = Path("data/original.csv")          # col1=index, col2=model, col3=prompt
-COMPARISONS_PATH = Path("data/elo_llama_responses.csv")  # TXT with "RANDOMIZED ORDER..." or CSV with a_model/a_index/b_model/b_index
+PROMPTS_PATH = Path("data/original.csv")          # col1=index, col2=model, col3=prompt, col4=summary
+COMPARISONS_PATH = Path("data/llama_outputs_summary.csv")  # TXT with "RANDOMIZED ORDER..." or CSV with a_model/a_index/b_model/b_index
 PROGRESS_PATH: Optional[Path] = None             # e.g., Path("data/progress.csv") to resume; or leave None
 AUTOSAVE_PATH: Optional[Path] = None             # e.g., Path("data/progress_autosave.csv")
 
@@ -42,15 +42,15 @@ def load_prompt_csv_from_text(text: str) -> Dict[Tuple[str, int], str]:
     data_rows = rows[1:] if has_header else rows
     mapping: Dict[Tuple[str, int], str] = {}
     for row in data_rows:
-        if len(row) < 3:
+        if len(row) < 4:  # Now we need at least 4 columns (index, model, prompt, summary)
             continue
         try:
             idx = int(row[0].strip())
         except Exception:
             continue
         model = row[1].strip()
-        prompt = row[2]
-        mapping[(model, idx)] = prompt
+        summary = row[3]  # Use summary column instead of prompt column
+        mapping[(model, idx)] = summary
     return mapping
 
 def parse_pairs_txt(txt: str) -> List[Dict]:
@@ -66,6 +66,14 @@ def parse_pairs_txt(txt: str) -> List[Dict]:
         p["pair_id"] = i
     return pairs
 
+def parse_model_index(item_str: str) -> Tuple[str, int]:
+    """Parse 'model[index]' format and return (model, index)"""
+    import re
+    match = re.match(r'([^[]+)\[(\d+)\]', item_str.strip())
+    if match:
+        return match.group(1), int(match.group(2))
+    return "", 0
+
 def parse_pairs_csv(text: str) -> List[Dict]:
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
@@ -78,17 +86,40 @@ def parse_pairs_csv(text: str) -> List[Dict]:
         return ""
     pairs: List[Dict] = []
     for row in reader:
-        a_model = get(row, ["amodel", "a", "amodelname"])
-        b_model = get(row, ["bmodel", "b", "bmodelname"])
-        a_idx_s = get(row, ["aindex", "aidx", "a_index", "a_idx"])
-        b_idx_s = get(row, ["bindex", "bidx", "b_index", "b_idx"])
-        if not (a_model and b_model and a_idx_s and b_idx_s):
-            continue
-        try:
-            a_idx = int(a_idx_s); b_idx = int(b_idx_s)
-        except Exception:
-            continue
-        pairs.append({"a_model": a_model, "a_idx": a_idx, "b_model": b_model, "b_idx": b_idx})
+        # First try the new format with Item_A and Item_B
+        item_a = get(row, ["item_a", "itema"])
+        item_b = get(row, ["item_b", "itemb"])
+        
+        if item_a and item_b:
+            # Parse model[index] format
+            a_model, a_idx = parse_model_index(item_a)
+            b_model, b_idx = parse_model_index(item_b)
+            
+            # Get summaries if available
+            summary_a = get(row, ["summary_a", "summarya"])
+            summary_b = get(row, ["summary_b", "summaryb"])
+            
+            if a_model and b_model and a_idx and b_idx:
+                pair_data = {"a_model": a_model, "a_idx": a_idx, "b_model": b_model, "b_idx": b_idx}
+                if summary_a:
+                    pair_data["a_summary"] = summary_a
+                if summary_b:
+                    pair_data["b_summary"] = summary_b
+                pairs.append(pair_data)
+        else:
+            # Fallback to old format
+            a_model = get(row, ["amodel", "a", "amodelname"])
+            b_model = get(row, ["bmodel", "b", "bmodelname"])
+            a_idx_s = get(row, ["aindex", "aidx", "a_index", "a_idx"])
+            b_idx_s = get(row, ["bindex", "bidx", "b_index", "b_idx"])
+            if not (a_model and b_model and a_idx_s and b_idx_s):
+                continue
+            try:
+                a_idx = int(a_idx_s); b_idx = int(b_idx_s)
+            except Exception:
+                continue
+            pairs.append({"a_model": a_model, "a_idx": a_idx, "b_model": b_model, "b_idx": b_idx})
+    
     for i, p in enumerate(pairs):
         p["pair_id"] = i
     return pairs
@@ -96,10 +127,14 @@ def parse_pairs_csv(text: str) -> List[Dict]:
 def attach_prompts(pairs: List[Dict], prompt_map: Dict[Tuple[str, int], str]) -> List[Dict]:
     out = []
     for p in pairs:
+        # Use summaries from CSV if available, otherwise look up from prompt_map
+        a_prompt = p.get("a_summary") or prompt_map.get((p["a_model"], p["a_idx"]))
+        b_prompt = p.get("b_summary") or prompt_map.get((p["b_model"], p["b_idx"]))
+        
         out.append({
             **p,
-            "a_prompt": prompt_map.get((p["a_model"], p["a_idx"])),
-            "b_prompt": prompt_map.get((p["b_model"], p["b_idx"]))
+            "a_prompt": a_prompt,
+            "b_prompt": b_prompt
         })
     return out
 
