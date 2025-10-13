@@ -66,13 +66,13 @@ def parse_pairs_txt(txt: str) -> List[Dict]:
         p["pair_id"] = i
     return pairs
 
-def parse_model_index(item_str: str) -> Tuple[str, int]:
+def parse_model_index(item_str: str) -> Tuple[str, Optional[int]]:
     """Parse 'model[index]' format and return (model, index)"""
     import re
     match = re.match(r'([^[]+)\[(\d+)\]', item_str.strip())
     if match:
         return match.group(1), int(match.group(2))
-    return "", 0
+    return "", None
 
 def parse_pairs_csv(text: str) -> List[Dict]:
     reader = csv.DictReader(io.StringIO(text))
@@ -85,6 +85,7 @@ def parse_pairs_csv(text: str) -> List[Dict]:
                 return (row.get(header_map[k]) or "").strip()
         return ""
     pairs: List[Dict] = []
+    
     for row in reader:
         # First try the new format with Item_A and Item_B
         item_a = get(row, ["item_a", "itema"])
@@ -99,7 +100,7 @@ def parse_pairs_csv(text: str) -> List[Dict]:
             summary_a = get(row, ["summary_a", "summarya"])
             summary_b = get(row, ["summary_b", "summaryb"])
             
-            if a_model and b_model and a_idx and b_idx:
+            if a_model and b_model and a_idx is not None and b_idx is not None:
                 pair_data = {"a_model": a_model, "a_idx": a_idx, "b_model": b_model, "b_idx": b_idx}
                 if summary_a:
                     pair_data["a_summary"] = summary_a
